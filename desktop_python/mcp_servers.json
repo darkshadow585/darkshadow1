@@ -1,0 +1,46 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "enabled": true,
+      "description": "Stage 1: Official Microsoft Playwright Accessibility-Tree MCP connected to Captain's Edge CDP (port 9222)",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--cdp-endpoint",
+        "http://localhost:9222"
+      ]
+    },
+    "windows": {
+      "enabled": false,
+      "description": "Stage 2: CursorTouch/Windows-MCP native Windows 11 OS UI Automation server (set enabled: true after installing uvx)",
+      "command": "uvx",
+      "args": [
+        "windows-mcp"
+      ]
+    },
+    "composio": {
+      "enabled": false,
+      "description": "Stage 3: Composio MCP server (handled directly via ComposioAppBridge in composio_bridge.py)",
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.composio.dev/mcp"
+      ],
+      "env": {
+        "COMPOSIO_API_KEY": "ck_9RHrHe2RGrQx0YYCneki"
+      }
+    },
+    "filesystem": {
+      "enabled": false,
+      "description": "Official MCP Filesystem server (set enabled: true and customize your allowed folder path)",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\Public\\Documents"
+      ]
+    }
+  }
+}

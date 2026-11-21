@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DarkShadow WebGL2 Particle Core</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: transparent !important;
+      user-select: none;
+    }
+    #gl-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: transparent;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gl-canvas"></canvas>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById("gl-canvas");
+
+      const gl = canvas.getContext("webgl2", {
+        alpha: true,
+        antialias: true,
+        premultipliedAlpha: true,
+      });
+
+      const VERT = `#version 300 es
+        precision highp float;
+        layout(location = 0) in vec3 aPos;
+        layout(location = 1) in vec3 aColor;
+        layout(location = 2) in float aSize;
+        layout(location = 3) in float aAlpha;
+        uniform float uAspect;
+        uniform float uDpr;
+        out vec3 vColor;
+        out float vAlpha;
+        void main() {
+          // Perspective projection with uniform X and Y scale
+          float zCam = 2.4 - aPos.z;
+          float persp = 2.0 / max(0.4, zCam);
+          gl_Position = vec4((aPos.x / uAspect) * persp, aPos.y * persp, 0.0, 1.0);
+          gl_PointSize = clamp(aSize * persp * uDpr, 1.6, 26.0);
+          vColor = aColor;
+          vAlpha = aAlpha * clamp(persp * 0.95, 0.30, 1.0);
+        }
+      `;
+
+      const FRAG = `#version 300 es
+        precision highp float;
+        in vec3 vColor;
+        in float vAlpha;
+        out vec4 fragColor;
+        void main() {
+          vec2 c = gl_PointCoord - vec2(0.5);
+          float d2 = dot(c, c);
+          if (d2 > 0.25) discard;
+          // Ultra-crisp crystalline starlight core with celestial outer halo
+          float core = exp(-d2 * 36.0);
+          float halo = exp(-d2 * 7.5);
+          vec3 col = mix(vColor, vec3(1.0), core * 0.65);
+          float a = clamp((core * 1.35 + halo * 0.45) * vAlpha, 0.0, 1.0);
+          fragColor = vec4(col * a, a);
+        }
+      `;
+
+      function makeShader(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        return s;
+      }
+
+      let prog = null, vao = null, vbo = null, uAspect = null, uDpr = null;
+      const COUNT = 6500;
+
+      const posX = new Float32Array(COUNT), posY = new Float32Array(COUNT), posZ = new Float32Array(COUNT);
+      const velX = new Float32Array(COUNT), velY = new Float32Array(COUNT), velZ = new Float32Array(COUNT);
+      const sphX = new Float32Array(COUNT), sphY = new Float32Array(COUNT), sphZ = new Float32Array(COUNT);
+
+      const colR = new Float32Array(COUNT);
+      const colG = new Float32Array(COUNT);
+      const colB = new Float32Array(COUNT);
+
+      const pPhase = new Float32Array(COUNT);
+      const sizes = new Float32Array(COUNT);
+      const alphas = new Float32Array(COUNT);
+      const verts = new Float32Array(COUNT * 8);
+
+      const golden = Math.PI * (1 + Math.sqrt(5));
+
+      // Compact, dense, refined spherical radius (half size of previous orb)
+      const ORB_RADIUS = 0.22;
+
+      for (let i = 0; i < COUNT; i++) {
+        const idx = i + 0.5;
+        const r1 = Math.sin(i * 12.9898) * 43758.5453;
+        const s = r1 - Math.floor(r1);
+        const r2 = Math.sin(i * 78.233 + 1.7) * 43758.5453;
+        const s2 = r2 - Math.floor(r2);
+
+        pPhase[i] = s2 * Math.PI * 2;
+
+        // Perfect 3D Fibonacci Sphere Geometry (Pure mathematical sphere)
+        const phi = Math.acos(1 - (2 * idx) / COUNT);
+        const theta = golden * idx;
+        const r = (i % 6 === 0) ? ORB_RADIUS * 0.90 + s * 0.025 : ORB_RADIUS + (s2 - 0.5) * 0.015;
+
+        sphX[i] = Math.sin(phi) * Math.cos(theta) * r;
+        sphY[i] = Math.cos(phi) * r;
+        sphZ[i] = Math.sin(phi) * Math.sin(theta) * r;
+
+        // Fountain Emergence Setup:
+        // Particles start below screen bottom, streaming upwards from left and right streams
+        const side = (i % 2 === 0) ? -1 : 1;
+        const spread = (Math.sin(i * 87.3) * 0.5 + 0.5);
+        posX[i] = side * (0.25 + spread * 0.85);
+        posY[i] = -1.6 - (i / COUNT) * 1.4;
+        posZ[i] = (Math.cos(i * 41.2) * 0.5) * 0.5;
+
+        // Upward launch velocity with inward bias
+        velX[i] = -side * (0.15 + spread * 0.25);
+        velY[i] = 3.6 + Math.random() * 2.4;
+        velZ[i] = (Math.random() - 0.5) * 0.4;
+
+        // Pure Crystalline Starlight Diamond White Palette
+        const bright = 0.94 + s * 0.06;
+        colR[i] = bright;
+        colG[i] = bright * (0.98 + s2 * 0.02);
+        colB[i] = 1.0;
+        sizes[i] = 1.8 + s * 2.2;
+        alphas[i] = 0.0;
+      }
+
+      if (gl) {
+        prog = gl.createProgram();
+        gl.attachShader(prog, makeShader(gl.VERTEX_SHADER, VERT));
+        gl.attachShader(prog, makeShader(gl.FRAGMENT_SHADER, FRAG));
+        gl.linkProgram(prog);
+        uAspect = gl.getUniformLocation(prog, "uAspect");
+        uDpr = gl.getUniformLocation(prog, "uDpr");
+        vao = gl.createVertexArray();
+        vbo = gl.createBuffer();
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, verts.byteLength, gl.DYNAMIC_DRAW);
+        const stride = 32;
+        gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
+        gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
+        gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, stride, 24);
+        gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 1, gl.FLOAT, false, stride, 28);
+        gl.bindVertexArray(null);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      }
+
+      let state = "listening";
+      let bass = 0, mid = 0, treble = 0;
+      let sBass = 0, sMid = 0, sTreble = 0;
+      let t = 0;
+      let lastNow = performance.now();
+
+      // Cosmic Emergence Animation (0 = streaming from bottom, 1 = fully assembled 3D sphere)
+      let assembleProgress = 0.0;
+      let targetAssemble = 1.0;
+
+      // Mouse tracking
+      let curMouseX = -999.0, curMouseY = -999.0;
+      let targetMouseX = -999.0, targetMouseY = -999.0;
+      let mouseActivity = 0.0;
+
+      window.DarkShadowFX = {
+        setState(nextState) {
+          state = nextState || "listening";
+          if (state === "dormant" || state === "dissolving") {
+            targetAssemble = 0.0;
+          } else {
+            targetAssemble = 1.0;
+          }
+        },
+        setAudio(b, m, tr) {
+          bass = Math.max(0, Math.min(1, Number(b) || 0));
+          mid = Math.max(0, Math.min(1, Number(m) || 0));
+          treble = Math.max(0, Math.min(1, Number(tr) || 0));
+        },
+        setCaption(mainText, subText) {
+          // Bottom text bar removed
+        },
+        setMouse(rx, ry) {
+          const mx = rx * 2.0 - 1.0;
+          const my = -(ry * 2.0 - 1.0);
+          if (targetMouseX > -900) {
+            const dx = mx - targetMouseX;
+            const dy = my - targetMouseY;
+            mouseActivity = Math.min(1.0, mouseActivity + Math.hypot(dx, dy) * 8.0);
+          } else {
+            curMouseX = mx;
+            curMouseY = my;
+          }
+          targetMouseX = mx;
+          targetMouseY = my;
+        },
+      };
+
+      window.addEventListener("mousemove", (e) => {
+        window.DarkShadowFX.setMouse(e.clientX / window.innerWidth, e.clientY / window.innerHeight);
+      });
+
+      function tick(now) {
+        const dt = Math.min(0.035, (now - lastNow) / 1000);
+        lastNow = now;
+        t += dt;
+
+        sBass += (bass - sBass) * Math.min(1, dt * 14);
+        sMid += (mid - sMid) * Math.min(1, dt * 14);
+        sTreble += (treble - sTreble) * Math.min(1, dt * 16);
+
+        // Smooth assembly transition from fountain to orb (~1.4s)
+        assembleProgress += (targetAssemble - assembleProgress) * Math.min(1.0, dt * 2.4);
+
+        // Mouse activity decay
+        mouseActivity = Math.max(0.0, mouseActivity - dt * 3.5);
+        if (targetMouseX > -900) {
+          curMouseX += (targetMouseX - curMouseX) * Math.min(1, dt * 14);
+          curMouseY += (targetMouseY - curMouseY) * Math.min(1, dt * 14);
+        }
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = window.innerWidth, h = window.innerHeight;
+        if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+          canvas.width = Math.round(w * dpr);
+          canvas.height = Math.round(h * dpr);
+        }
+
+        const aspect = Math.max(0.1, w / Math.max(1, h));
+
+        const isStandby = (state === "standby" || state === "sleep");
+
+        // STHIR ANCHOR:
+        // No dizzy round-and-round spinning while answering. Sphere stays stationary and calm!
+        const rotY = 0.0;
+        const cy = 1.0, sy = 0.0;
+
+        // Dynamic Voice Breathing: Shrink and spread with voice & speech (calibrated gentle pulse - not too big)
+        const speechExpansion = (sBass * 0.36 + sMid * 0.28 + sTreble * 0.16) * 0.72;
+        const breath = isStandby ? 0.0 : (Math.sin(t * 2.0) * 0.025);
+        const voiceBoost = 1.0 + speechExpansion + breath;
+
+        // Dynamics coefficients
+        const fountainStrength = (1.0 - assembleProgress) * 4.2;
+        const springK = 3.5 + assembleProgress * 15.0;
+        const damping = 4.2 + assembleProgress * 2.4;
+
+        for (let i = 0; i < COUNT; i++) {
+          const ox = sphX[i], oy = sphY[i], oz = sphZ[i];
+
+          // 1. Perfectly stationary fixed vertical axis, zero spin wobble:
+          const x1 = ox;
+          const y2 = oy;
+          const z2 = oz;
+
+          // Gentle coronal wave with voice expansion (shrinks & spreads dynamically)
+          const wave = 1.0 + 0.015 * Math.sin(pPhase[i] + t * 3.5);
+          const scale = voiceBoost * wave;
+
+          const targetX = x1 * scale;
+          const targetY = y2 * scale;
+          const targetZ = z2 * scale;
+
+          // 2. Interactive Mouse Cursor Repulsion (door-door bhage aur faile):
+          if (targetMouseX > -900) {
+            const pScreenX = posX[i] / aspect;
+            const pScreenY = posY[i];
+            const mdx = pScreenX - curMouseX;
+            const mdy = pScreenY - curMouseY;
+            const mDist = Math.hypot(mdx, mdy);
+            const repelRadius = 0.32;
+            if (mDist < repelRadius && mDist > 0.001) {
+              const repelNorm = 1.0 - mDist / repelRadius;
+              const push = repelNorm * repelNorm * 18.0 * (1.0 + mouseActivity * 1.8);
+              velX[i] += (mdx / mDist) * push * dt;
+              velY[i] += (mdy / mDist) * push * dt;
+              velZ[i] += (Math.sin(pPhase[i] + t * 4.0) * push * 0.6) * dt;
+            }
+          }
+
+          // 3. Upward Fountain Impulse during emergence
+          if (fountainStrength > 0.01) {
+            velY[i] += fountainStrength * dt * 9.0;
+          }
+
+          // 4. Spring restoring force: pulls particles into the 3D Fibonacci sphere
+          velX[i] += ((targetX - posX[i]) * springK - velX[i] * damping) * dt;
+          velY[i] += ((targetY - posY[i]) * springK - velY[i] * damping) * dt;
+          velZ[i] += ((targetZ - posZ[i]) * springK - velZ[i] * damping) * dt;
+
+          posX[i] += velX[i] * dt;
+          posY[i] += velY[i] * dt;
+          posZ[i] += velZ[i] * dt;
+
+          if (isStandby) {
+            alphas[i] = Math.max(0.22, alphas[i] - dt * 1.5);
+          } else {
+            alphas[i] = Math.min(0.95, alphas[i] + dt * 2.8);
+          }
+
+          const o = i * 8;
+          verts[o] = posX[i];
+          verts[o + 1] = posY[i];
+          verts[o + 2] = posZ[i];
+          verts[o + 3] = colR[i];
+          verts[o + 4] = colG[i];
+          verts[o + 5] = colB[i];
+          verts[o + 6] = sizes[i] * (1.0 + sBass * 0.35 + sTreble * 0.25);
+          verts[o + 7] = alphas[i];
+        }
+
+        if (gl && prog) {
+          gl.viewport(0, 0, canvas.width, canvas.height);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.useProgram(prog);
+          gl.uniform1f(uAspect, aspect);
+          gl.uniform1f(uDpr, dpr);
+          gl.bindVertexArray(vao);
+          gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, verts);
+          gl.drawArrays(gl.POINTS, 0, COUNT);
+          gl.bindVertexArray(null);
+        }
+        requestAnimationFrame(tick);
+      }
+
+      requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>
