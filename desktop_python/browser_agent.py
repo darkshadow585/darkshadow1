@@ -245,25 +245,17 @@ class _PlaywrightEdgeWorker:
                 except Exception:
                     pass
 
-        # Isolated fallback profile prevents ProcessSingleton crash if DarkShadowEdgeProfile is locked without CDP
-        fallback_profile = os.getenv(
-            "DARKSHADOW_EDGE_FALLBACK_PROFILE",
-            os.path.expandvars(r"%LOCALAPPDATA%\DarkShadowEdgeProfile_PW"),
-        )
-        _, port = _parse_cdp_host_port(cdp_http)
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=fallback_profile,
-            channel="msedge",
-            headless=False,
-            no_viewport=True,
-            args=[
-                f"--remote-debugging-port={port}",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-allow-origins=*",
-                "--no-first-run",
-            ],
-        )
-        return None, context, True
+        # If direct target failed, attempt clean reconnect after ensuring Edge CDP is up
+        if ensure_edge_cdp(cdp_http, wait_seconds=4.0):
+            target = _resolve_cdp_connect_target(cdp_http) or f"http://127.0.0.1:{port}"
+            try:
+                browser = playwright.chromium.connect_over_cdp(target, timeout=5000)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                return browser, context, False
+            except Exception:
+                pass
+
+        return None, None, False
 
     @staticmethod
     def _is_context_alive(browser: Any, context: Any) -> bool:
@@ -311,6 +303,10 @@ class _PlaywrightEdgeWorker:
             try:
                 if not self._is_context_alive(browser, context):
                     browser, context, owns_context = self._connect_or_launch(playwright)
+
+                if context is None:
+                    fut.set_exception(RuntimeError("Microsoft Edge CDP port 9222 par connect nahi ho paya."))
+                    continue
 
                 pages = [p for p in context.pages if not p.is_closed()]
                 page = None
