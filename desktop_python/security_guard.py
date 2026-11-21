@@ -36,6 +36,10 @@ _RISKY_ARG_RE = re.compile(
     r"\b(?:delete|remove|erase|rm\s+-rf|format|wipe|shutdown|restart|reboot|uninstall|kill\s+process)\b",
     re.IGNORECASE,
 )
+_COMPOSIO_WRITE_RE = re.compile(
+    r"(?:^|_)(?:SEND|CREATE|DELETE|REMOVE|UPDATE|PATCH|PUT|POST|REPLY|MERGE|CLOSE|INVITE|ARCHIVE|TRASH|MODIFY|INSERT|DROP)(?:$|_)",
+    re.IGNORECASE,
+)
 
 
 class PassphraseSecurityGuard:
@@ -223,6 +227,11 @@ class PassphraseSecurityGuard:
         if tool_name == "mcp_hub_action" and action == "call_tool":
             payload = json.dumps(args, ensure_ascii=False)
             if _RISKY_ARG_RE.search(payload):
+                return True
+        if tool_name == "composio_action" and bool(args.get("confirmed")):
+            slug = str(args.get("action_slug") or "").strip().upper()
+            payload = json.dumps(args, ensure_ascii=False)
+            if _COMPOSIO_WRITE_RE.search(slug) or _RISKY_ARG_RE.search(payload):
                 return True
         return False
 

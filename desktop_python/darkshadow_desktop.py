@@ -38,11 +38,11 @@ from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QDialog,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QMenu,
     QPushButton,
     QSystemTrayIcon,
+    QTextEdit,
     QVBoxLayout,
 )
 
@@ -129,13 +129,14 @@ def _apply_win32_layer(hwnd_int: int, behind_apps: bool) -> None:
         if new_style != ex_style:
             set_long(hwnd, _GWL_EXSTYLE, new_style)
 
+        ptr_mask = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
         flags = _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_NOOWNERZORDER
         if behind_apps:
             if ex_style & _WS_EX_TOPMOST:
-                user32.SetWindowPos(hwnd, ctypes.c_void_p(_HWND_NOTOPMOST), 0, 0, 0, 0, flags)
-            user32.SetWindowPos(hwnd, ctypes.c_void_p(_HWND_BOTTOM), 0, 0, 0, 0, flags)
+                user32.SetWindowPos(hwnd, ctypes.c_void_p(_HWND_NOTOPMOST & ptr_mask), 0, 0, 0, 0, flags)
+            user32.SetWindowPos(hwnd, ctypes.c_void_p(_HWND_BOTTOM & ptr_mask), 0, 0, 0, 0, flags)
         else:
-            user32.SetWindowPos(hwnd, ctypes.c_void_p(_HWND_TOPMOST), 0, 0, 0, 0, flags)
+            user32.SetWindowPos(hwnd, ctypes.c_void_p(_HWND_TOPMOST & ptr_mask), 0, 0, 0, 0, flags)
     except Exception:
         pass
 
@@ -177,7 +178,8 @@ class QuickCommandDialog(QDialog):
             "border-radius: 8px; padding: 10px; font-size: 14px; }"
             "QPushButton { background-color: #00D2FF; color: #0d1117; font-weight: bold; "
             "border-radius: 8px; padding: 10px 16px; }"
-            "QLabel { color: #c9d1d9; font-size: 13px; padding: 6px 2px; }"
+            "QTextEdit { background-color: #11161d; color: #c9d1d9; border: 1px solid #21262d; "
+            "border-radius: 8px; font-size: 13px; padding: 8px; }"
         )
 
         layout = QVBoxLayout(self)
@@ -190,8 +192,11 @@ class QuickCommandDialog(QDialog):
         row.addWidget(self.input)
         row.addWidget(self.btn)
 
-        self.output = QLabel("Ready — Alt+Space to toggle | F8 Wake | Ctrl+Alt+K Kill Switch")
-        self.output.setWordWrap(True)
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setMinimumHeight(64)
+        self.output.setMaximumHeight(240)
+        self.output.setPlainText("Ready — Alt+Space to toggle | F8 Wake | Ctrl+Alt+K Kill Switch")
 
         layout.addLayout(row)
         layout.addWidget(self.output)
@@ -203,16 +208,19 @@ class QuickCommandDialog(QDialog):
             return
         self.input.setEnabled(False)
         self.btn.setEnabled(False)
-        self.output.setText("Thinking...")
+        self.output.setPlainText("Thinking...")
 
         def _worker() -> None:
-            reply = self._execute_prompt_fn(text)
+            try:
+                reply = str(self._execute_prompt_fn(text) or "Done.")
+            except Exception as exc:
+                reply = f"Error: {type(exc).__name__}: {exc}"
             self.response_ready.emit(reply)
 
         threading.Thread(target=_worker, daemon=True, name="ds-text-cmd").start()
 
     def _show_response(self, reply: str) -> None:
-        self.output.setText(reply)
+        self.output.setPlainText(reply)
         self.input.clear()
         self.input.setEnabled(True)
         self.btn.setEnabled(True)
@@ -299,7 +307,11 @@ class DarkShadowDesktopApp(QWebEngineView):
         self.mcp.set_job_complete_callback(self._on_background_job_done)
 
         self.sentinel = (
-            DesktopSentinel(self.memory, lambda msg: self.bridge.sentinel_alert.emit(msg))
+            DesktopSentinel(
+                self.memory,
+                lambda msg: self.bridge.sentinel_alert.emit(msg),
+                monitor_battery=False,
+            )
             if HAS_SENTINEL
             else None
         )
@@ -628,6 +640,8 @@ class DarkShadowDesktopApp(QWebEngineView):
         last_error: Exception | None = None
 
         for model_name in models_to_try:
+            any_tool_executed = False
+            last_tool_msg = ""
             try:
                 convo = list(contents)
                 for _step in range(4):
@@ -648,6 +662,9 @@ class DarkShadowDesktopApp(QWebEngineView):
                     fn_parts = []
                     for call in calls[:4]:
                         out = self.mcp.execute_tool(str(call.name), dict(call.args or {}), source="text_palette")
+                        any_tool_executed = True
+                        if isinstance(out, dict):
+                            last_tool_msg = str(out.get("message") or out.get("analysis") or last_tool_msg)
                         fn_parts.append(
                             types.Part.from_function_response(
                                 name=str(call.name),
@@ -655,10 +672,20 @@ class DarkShadowDesktopApp(QWebEngineView):
                             )
                         )
                     convo.append(types.Content(role="user", parts=fn_parts))
+
+                # CRITICAL: Never fall through to a backup model and re-run tools a second time!
+                if any_tool_executed:
+                    summary = last_tool_msg or "Captain, requested tool action execute ho gaya."
+                    self._record_live_turn(prompt, summary)
+                    return summary
             except Exception as exc:
                 last_error = exc
                 if RATE_SHIELD.is_quota_error(exc):
                     RATE_SHIELD.mark_rate_limited(model_name, cooldown_seconds=45.0)
+                if any_tool_executed:
+                    summary = last_tool_msg or f"Tool execute ho gaya, lekin final summary mein error aaya: {type(exc).__name__}"
+                    self._record_live_turn(prompt, summary)
+                    return summary
                 print(f"[Gemini Fallback] {model_name} failed ({type(exc).__name__}), trying next...")
                 continue
 
@@ -675,6 +702,11 @@ class DarkShadowDesktopApp(QWebEngineView):
             self.sentinel.stop()
         self.live_voice.stop()
         self.mcp.cancel_all_background_jobs()
+        try:
+            from reasoning_engine_v2 import REASONING_ENGINE_V2
+            REASONING_ENGINE_V2.shutdown()
+        except Exception:
+            pass
         try:
             from reasoning_engine import REASONING_ENGINE
             REASONING_ENGINE.shutdown()

@@ -25,9 +25,12 @@ pywinauto>=0.6.8
 pydantic>=2.10.0
 pydantic-ai>=0.1.0
 langgraph>=0.3.0
+langgraph-checkpoint-sqlite>=2.0.0
 
-# [C-All] Super-Human Living Memory (Mem0 + Local Qdrant)
+# [C-All] Super-Human Living Memory (Mem0 + Local Qdrant) & Knowledge Vault
 mem0ai>=0.1.80
+pypdf>=5.0.0
+python-docx>=1.1.0
 
 # [D-1] Official Universal MCP Client SDK
 mcp>=1.6.0
@@ -35,3 +38,8 @@ mcp>=1.6.0
 # [Stage 03] Composio External SaaS Integrations
 composio>=0.33.0
 composio-langgraph>=0.33.0
+
+# [Desktop Utilities] YouTube resolution, Toast Notifications & Set-of-Marks Clicking
+yt-dlp>=2024.12.0
+winotify>=1.1.0
+pyautogui>=0.9.54

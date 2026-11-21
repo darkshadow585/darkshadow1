@@ -43,6 +43,10 @@ SENSITIVE_LABELS = re.compile(
 SECRET_SHAPES = (
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\bsk-[0-9A-Za-z_-]{16,}\b", re.IGNORECASE),
+    re.compile(r"\bck_[0-9A-Za-z_-]{12,}\b"),
+    re.compile(r"\bsntry[a-z]?_[0-9A-Za-z_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[0-9A-Za-z]{20,}\b"),
+    re.compile(r"\btvly-[0-9A-Za-z_-]{16,}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
 CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")

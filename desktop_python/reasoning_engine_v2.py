@@ -80,12 +80,17 @@ class HierarchicalGraphState(TypedDict):
     last_verification: dict[str, Any]
     replan_count: int
     approved: bool
+    hitl_confirmed: bool
     done: bool
     final_answer: str
 
 
 _SENSITIVE_STEP_RE = re.compile(
     r"\b(delete|remove|format|send_whatsapp|send_email|gmail_send|create_issue|shutdown|restart|kill|terminate|rm\s+-rf)\b",
+    re.IGNORECASE,
+)
+_COMPOSIO_MUTATING_RE = re.compile(
+    r"(?:^|_)(?:SEND|CREATE|DELETE|REMOVE|UPDATE|PATCH|PUT|POST|REPLY|MERGE|CLOSE|INVITE|ARCHIVE|TRASH|MODIFY|INSERT|DROP)(?:$|_)",
     re.IGNORECASE,
 )
 MAX_STEPS = 12
@@ -117,7 +122,7 @@ def _call_gemini_structured(prompt: str, schema_cls: type[BaseModel]) -> BaseMod
                     "response_mime_type": "application/json",
                     "response_schema": schema_cls,
                 }
-                if is_gemini_4_model(model_id) and hasattr(types, "ThinkingConfig"):
+                if is_gemini_4_model(model_id) and hasattr(types, "ThinkingConfig") and hasattr(types, "ThinkingLevel"):
                     cfg["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel.HIGH)
                 resp = client.models.generate_content(
                     model=model_id,
@@ -305,15 +310,32 @@ class DarkShadowReasoningEngine:
                 return {}
             act = state["next_action"]
             tool, args_str = str(act.get("tool", "")), str(act.get("args_json", "{}"))
+            parsed_args = _parse_args_json(args_str)
             shield = check_hard_shields(f"{tool} {args_str}")
             if shield:
-                return {"done": True, "approved": False, "final_answer": f"Shield blocked: {shield}"}
+                return {"done": True, "approved": False, "hitl_confirmed": False, "final_answer": f"Shield blocked: {shield}"}
             hitl_prob = float(state["route_decision"].get("requires_hitl_prob", 0.0))
-            if act.get("requires_confirmation") or hitl_prob >= 0.7 or _SENSITIVE_STEP_RE.search(f"{tool} {args_str}"):
-                ok = interrupt({"type": "captain_approval_required", "tool": tool, "args": _parse_args_json(args_str)})
+            is_mutating_composio = (
+                tool == "composio_action"
+                and bool(_COMPOSIO_MUTATING_RE.search(str(parsed_args.get("action_slug", ""))))
+            )
+            needs_hitl = bool(
+                act.get("requires_confirmation")
+                or hitl_prob >= 0.7
+                or is_mutating_composio
+                or _SENSITIVE_STEP_RE.search(f"{tool} {args_str}")
+            )
+            if needs_hitl:
+                ok = interrupt({"type": "captain_approval_required", "tool": tool, "args": parsed_args})
                 if not bool(ok):
-                    return {"done": True, "approved": False, "final_answer": "Captain ne step cancel kar diya."}
-            return {"approved": True}
+                    return {
+                        "done": True,
+                        "approved": False,
+                        "hitl_confirmed": False,
+                        "final_answer": "Captain ne step cancel kar diya.",
+                    }
+                return {"approved": True, "hitl_confirmed": True}
+            return {"approved": True, "hitl_confirmed": False}
 
         def execute_node(state: HierarchicalGraphState) -> dict[str, Any]:
             if state.get("done"):
@@ -321,12 +343,16 @@ class DarkShadowReasoningEngine:
             act = state["next_action"]
             tool = str(act.get("tool", ""))
             args = _parse_args_json(str(act.get("args_json", "{}")))
-            if tool == "composio_action" and state.get("approved"):
-                args["confirmed"] = True
+            # Only pass confirmed=True to Composio when Captain explicitly approved via HITL interrupt
+            if tool == "composio_action":
+                if state.get("hitl_confirmed"):
+                    args["confirmed"] = True
+                else:
+                    args["confirmed"] = False
             res = _execute_unified_tool(tool, args, cancel_event=self._cancel_event)
             logs = list(state["step_logs"])
             logs.append({"step": state["step_count"] + 1, "tool": tool, "args": args, "result": res})
-            return {"step_logs": logs, "step_count": state["step_count"] + 1}
+            return {"step_logs": logs, "step_count": state["step_count"] + 1, "hitl_confirmed": False}
 
         def verify_step_node(state: HierarchicalGraphState) -> dict[str, Any]:
             if state.get("done") or not state["step_logs"]:
@@ -399,10 +425,78 @@ class DarkShadowReasoningEngine:
     def cancel_active(self) -> None:
         self._cancel_event.set()
 
+    def status(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "engine": "reasoning_engine_v2",
+            "langgraph_available": self._langgraph_available,
+            "sqlite_checkpoint_active": self._sqlite_conn is not None,
+            "last_goal": self._last_goal,
+            "last_trace_steps": len(self._last_successful_trace),
+        }
+
+    def get_last_successful_trace(self) -> tuple[str, list[dict[str, Any]]]:
+        return self._last_goal, list(self._last_successful_trace)
+
+    def shutdown(self) -> None:
+        self._cancel_event.set()
+        if self._sqlite_conn is not None:
+            try:
+                self._sqlite_conn.close()
+            except Exception:
+                pass
+            self._sqlite_conn = None
+
+    def _format_graph_outcome(self, tid: str, config: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+        try:
+            snapshot = self._graph.get_state(config)
+            if snapshot and getattr(snapshot, "next", None):
+                interrupt_payload: Any = {}
+                tasks = getattr(snapshot, "tasks", None) or []
+                for task in tasks:
+                    interrupts = getattr(task, "interrupts", None) or []
+                    if interrupts:
+                        interrupt_payload = getattr(interrupts[0], "value", interrupts[0])
+                        break
+                tool_name = (
+                    interrupt_payload.get("tool", "sensitive_action")
+                    if isinstance(interrupt_payload, dict)
+                    else "sensitive_action"
+                )
+                return {
+                    "ok": True,
+                    "needs_approval": True,
+                    "thread_id": tid,
+                    "approval_details": interrupt_payload,
+                    "message": (
+                        f"Captain, '{tool_name}' chalane ke liye aapki approval chahiye "
+                        f"(thread_id: {tid}). Approve karne ke liye resume_approve bolein ya cancel karein."
+                    ),
+                }
+        except Exception:
+            pass
+
+        step_logs = result.get("step_logs") or []
+        successful = [
+            {"tool": s.get("tool", ""), "args": s.get("args", {})}
+            for s in step_logs
+            if isinstance(s, dict) and isinstance(s.get("result"), dict) and s["result"].get("ok")
+        ]
+        if successful:
+            self._last_goal = str(result.get("goal") or self._last_goal)
+            self._last_successful_trace = successful
+
+        return {
+            "ok": True,
+            "thread_id": tid,
+            "route": result.get("route_decision"),
+            "steps_executed": len(step_logs),
+            "message": result.get("final_answer", "") or "Captain, task complete ho gaya.",
+        }
+
     def run_goal(self, goal: str, thread_id: str | None = None) -> dict[str, Any]:
         self._cancel_event.clear()
         if not self._langgraph_available or self._graph is None:
-            # Fallback to pure ReAct engine
             from reasoning_engine import REASONING_ENGINE as LEGACY_RE
             return LEGACY_RE.run_goal(goal, thread_id=thread_id)
 
@@ -420,15 +514,32 @@ class DarkShadowReasoningEngine:
             "last_verification": {},
             "replan_count": 0,
             "approved": True,
+            "hitl_confirmed": False,
             "done": False,
             "final_answer": "",
         }
+        cfg = {"configurable": {"thread_id": tid}}
         try:
-            result = self._graph.invoke(init_state, config={"configurable": {"thread_id": tid}})
-            return {"ok": True, "thread_id": tid, "route": result.get("route_decision"), "message": result.get("final_answer", "")}
+            result = self._graph.invoke(init_state, config=cfg)
+            return self._format_graph_outcome(tid, cfg, result if isinstance(result, dict) else {})
         except Exception as exc:
             log_error("reasoning_engine_v2", f"LangGraph execution error: {exc}", exception=exc)
             return {"ok": False, "error_code": "GRAPH_EXEC_ERROR", "message": f"Graph execution error: {exc}"}
+
+    def resume_approval(self, thread_id: str, approved: bool) -> dict[str, Any]:
+        if not thread_id or not thread_id.strip():
+            return {"ok": False, "error_code": "MISSING_THREAD_ID", "message": "Resume ke liye thread_id zaroori hai."}
+        if not self._langgraph_available or self._graph is None:
+            from reasoning_engine import REASONING_ENGINE as LEGACY_RE
+            return LEGACY_RE.resume_approval(thread_id, approved=approved)
+        try:
+            from langgraph.types import Command  # type: ignore
+            cfg = {"configurable": {"thread_id": thread_id.strip()}}
+            result = self._graph.invoke(Command(resume=bool(approved)), config=cfg)
+            return self._format_graph_outcome(thread_id.strip(), cfg, result if isinstance(result, dict) else {})
+        except Exception as exc:
+            log_error("reasoning_engine_v2", f"LangGraph resume error: {exc}", exception=exc)
+            return {"ok": False, "error_code": "GRAPH_RESUME_ERROR", "message": f"Resume error: {exc}"}
 
 
 REASONING_ENGINE_V2 = DarkShadowReasoningEngine()

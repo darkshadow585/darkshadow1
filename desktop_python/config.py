@@ -83,31 +83,67 @@ def get_live_model() -> str:
     return os.getenv("DARKSHADOW_LIVE_MODEL", DEFAULT_LIVE_MODEL).strip() or DEFAULT_LIVE_MODEL
 
 
-def get_cdp_url() -> str:
-    """Return live Microsoft Edge CDP endpoint, auto-detecting localhost, ::1, or fallback."""
+_CDP_CACHE_URL: str = ""
+_CDP_CACHE_TS: float = 0.0
+_CDP_CACHE_TTL: float = 3.0
+
+
+def get_composio_api_key() -> str:
+    return os.getenv("COMPOSIO_API_KEY", "").strip()
+
+
+def get_composio_mcp_url() -> str:
+    return os.getenv("COMPOSIO_MCP_URL", "https://connect.composio.dev/mcp").strip() or "https://connect.composio.dev/mcp"
+
+
+def get_cdp_url(force_refresh: bool = False) -> str:
+    """Return live Microsoft Edge CDP endpoint, prioritizing IPv4 127.0.0.1 with IPv6 fallback and short TTL cache."""
+    global _CDP_CACHE_URL, _CDP_CACHE_TS
+    import time
     import urllib.request
+
+    now = time.monotonic()
+    if not force_refresh and _CDP_CACHE_URL and (now - _CDP_CACHE_TS) < _CDP_CACHE_TTL:
+        return _CDP_CACHE_URL
+
     configured = os.getenv("DARKSHADOW_EDGE_CDP_URL", "").strip()
     candidates = [
         configured,
-        "http://localhost:9222",
-        "http://[::1]:9222",
         "http://127.0.0.1:9222",
-        "http://localhost:9333",
+        "http://[::1]:9222",
+        "http://localhost:9222",
         "http://127.0.0.1:9333",
+        "http://[::1]:9333",
+        "http://localhost:9333",
     ]
+    seen: set[str] = set()
     for raw in candidates:
         if not raw:
             continue
         u = raw.rstrip("/")
+        if u in seen:
+            continue
+        seen.add(u)
         try:
-            with urllib.request.urlopen(f"{u}/json/version", timeout=0.35) as resp:
+            req = urllib.request.Request(f"{u}/json/version", headers={"Host": "localhost"})
+            with urllib.request.urlopen(req, timeout=0.45) as resp:
                 if resp.status == 200:
+                    _CDP_CACHE_URL = u
+                    _CDP_CACHE_TS = now
                     return u
         except Exception:
             continue
-    return configured or "http://localhost:9222"
+    return (configured.rstrip("/") if configured else "") or "http://127.0.0.1:9222"
+
+
+def invalidate_cdp_cache() -> None:
+    """Clear cached CDP URL after launching or restarting Edge."""
+    global _CDP_CACHE_URL, _CDP_CACHE_TS
+    _CDP_CACHE_URL = ""
+    _CDP_CACHE_TS = 0.0
 
 
 def is_gemini_4_model(model_name: str) -> bool:
     """Gemini 4 models do not accept deprecated sampling params (temperature/top_p/top_k)."""
     return "gemini-4" in (model_name or "").lower()
+

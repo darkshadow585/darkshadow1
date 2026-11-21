@@ -1,13 +1,19 @@
 """
-Upgrade #3 (Fixed): Next-Gen Microsoft Edge CDP + Playwright Accessibility/DOM Browser Agent.
-=============================================================================================
+Upgrade #3 (Hardened & Fixed): Microsoft Edge CDP + Playwright Accessibility/DOM Browser Agent.
+===============================================================================================
 Fixes applied:
-  - Fixed scroll_page JS SyntaxError (`() => { window.scrollBy(...); return window.scrollY; }`)!
-  - Removed ALL shell=True subprocess launches (zero command injection, safe with '&' URLs!).
-  - Reads CDP_URL dynamically via config.get_cdp_url() AFTER .env is loaded.
-  - Honest seek_video(): returns ok=False when all tiers fail (no more lying!) and removed
-    dangerous blind '0' keystroke to random foreground apps.
-  - Verifies element text against Hard Shields in click_element for both element_id and text_query.
+  - Removed blocking network probe (`CDP_URL = get_cdp_url()`) at module import time!
+  - Fixed Windows IPv4/IPv6 bug in `_is_cdp_reachable()` (never rewrites `[::1]` to `127.0.0.1`;
+    probes both IPv4 & IPv6 when `localhost` is configured!).
+  - Added `_fetch_cdp_version()` to extract exact `webSocketDebuggerUrl` so Playwright CDP
+    connects reliably without DNS/IPv6 race conditions.
+  - Fixed `ensure_edge_cdp()`: safe `urlparse` port extraction, passes `--remote-debugging-address=127.0.0.1`
+    + `--remote-allow-origins=*`, and waits up to 6s for cold-start Edge readiness.
+  - Fixed `_PlaywrightEdgeWorker`: calls `ensure_edge_cdp()`, checks `browser.is_connected()`,
+    re-attaches over CDP cleanly on disconnect, uses isolated fallback profile (`DarkShadowEdgeProfile_PW`)
+    to prevent ProcessSingleton lock crashes, and NEVER closes the user's CDP browser on shutdown!
+  - Routed `play_media_in_edge()` and `seek_video()` through `_PlaywrightEdgeWorker` (eliminates
+    Playwright Sync API inside asyncio loop crash and duplicate CDP connections!).
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ import urllib.request
 from concurrent.futures import Future
 from typing import Any, Callable
 
-from config import get_cdp_url
+from config import get_cdp_url, invalidate_cdp_cache
 from windows_tools import check_hard_shields, find_edge_executable, open_in_edge, validate_http_url
 
 try:
@@ -33,7 +39,8 @@ try:
 except Exception:
     HAS_PLAYWRIGHT = False
 
-CDP_URL = get_cdp_url()
+# Lazy default (no blocking network I/O at import time!)
+CDP_URL = os.getenv("DARKSHADOW_EDGE_CDP_URL", "http://127.0.0.1:9222").strip() or "http://127.0.0.1:9222"
 
 _EXTRACT_ELEMENTS_JS = """
 () => {
@@ -78,34 +85,82 @@ _EXTRACT_ELEMENTS_JS = """
 """
 
 
-def _is_cdp_reachable(cdp_url: str | None = None) -> bool:
+def _parse_cdp_host_port(cdp_url: str) -> tuple[str, int]:
+    """Safely extract (host, port) from IPv4, IPv6 (`http://[::1]:9222`), or hostname URLs."""
+    parsed = urllib.parse.urlparse(cdp_url.strip())
+    host = parsed.hostname or "127.0.0.1"
+    try:
+        port = int(parsed.port or 9222)
+    except Exception:
+        port = 9222
+    return host, port
+
+
+def _format_http_host(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
+
+
+def _fetch_cdp_version(cdp_url: str | None = None, timeout: float = 0.6) -> dict[str, Any] | None:
+    """
+    Probe Microsoft Edge `/json/version` cleanly across IPv4 and IPv6 without rewriting `::1` to `127.0.0.1`.
+    Returns parsed JSON dict with added `_resolved_http_url` on success, else None.
+    """
     target = (cdp_url or get_cdp_url()).rstrip("/")
-    try:
-        parsed = urllib.parse.urlparse(target)
-        host = parsed.hostname or "127.0.0.1"
-        if host in ("localhost", "::1"):
-            host = "127.0.0.1"
-        port = parsed.port or 9222
-        with socket.create_connection((host, port), timeout=0.15):
-            pass
-    except Exception:
-        return False
+    host, port = _parse_cdp_host_port(target)
 
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/json/version", headers={"Host": "localhost"})
-        with urllib.request.urlopen(req, timeout=0.6) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+    # Probe exact host first; if localhost was requested, check BOTH IPv4 and IPv6!
+    if host == "localhost":
+        probe_hosts = ["127.0.0.1", "::1"]
+    elif host in ("127.0.0.1", "::1"):
+        probe_hosts = [host, "::1" if host == "127.0.0.1" else "127.0.0.1"]
+    else:
+        probe_hosts = [host]
+
+    for h in probe_hosts:
+        try:
+            with socket.create_connection((h, port), timeout=min(0.25, timeout)):
+                pass
+        except Exception:
+            continue
+
+        base = _format_http_host(h, port)
+        try:
+            req = urllib.request.Request(f"{base}/json/version", headers={"Host": "localhost"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    if isinstance(data, dict):
+                        data["_resolved_http_url"] = base
+                        return data
+        except Exception:
+            continue
+    return None
 
 
-def ensure_edge_cdp(cdp_url: str | None = None) -> bool:
-    """Return True if Microsoft Edge CDP is reachable; otherwise launch Edge with debugging port."""
-    url = (cdp_url or get_cdp_url()).rstrip("/")
+def _is_cdp_reachable(cdp_url: str | None = None) -> bool:
+    return _fetch_cdp_version(cdp_url) is not None
+
+
+def _resolve_cdp_connect_target(cdp_url: str | None = None) -> str | None:
+    """Return the most reliable CDP target (WebSocket URL if available, else resolved HTTP base URL)."""
+    info = _fetch_cdp_version(cdp_url)
+    if not info:
+        return None
+    ws_url = str(info.get("webSocketDebuggerUrl") or "").strip()
+    if ws_url.startswith(("ws://", "wss://")):
+        return ws_url
+    return str(info.get("_resolved_http_url") or "") or None
+
+
+def ensure_edge_cdp(cdp_url: str | None = None, wait_seconds: float = 6.0) -> bool:
+    """Return True if Microsoft Edge CDP is reachable; otherwise launch Edge with debugging port and wait."""
+    url = (cdp_url or get_cdp_url(force_refresh=True)).rstrip("/")
     if _is_cdp_reachable(url):
         return True
     try:
-        port = url.rsplit(":", 1)[-1]
+        _, port = _parse_cdp_host_port(url)
         user_data = os.getenv(
             "DARKSHADOW_EDGE_PROFILE",
             os.path.expandvars(r"%LOCALAPPDATA%\DarkShadowEdgeProfile"),
@@ -113,17 +168,22 @@ def ensure_edge_cdp(cdp_url: str | None = None) -> bool:
         edge_exe = find_edge_executable()
         args = [
             f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-allow-origins=*",
             f"--user-data-dir={user_data}",
             "--no-first-run",
+            "--no-default-browser-check",
         ]
         if edge_exe:
             subprocess.Popen([edge_exe, *args], shell=False)
         else:
             subprocess.Popen(["cmd", "/c", "start", "", "msedge", *args], shell=False)
 
-        for _ in range(3):
-            time.sleep(0.35)
+        deadline = time.monotonic() + max(1.0, float(wait_seconds))
+        while time.monotonic() < deadline:
+            time.sleep(0.45)
             if _is_cdp_reachable(url):
+                invalidate_cdp_cache()
                 return True
     except Exception:
         pass
@@ -133,13 +193,16 @@ def ensure_edge_cdp(cdp_url: str | None = None) -> bool:
 class _PlaywrightEdgeWorker:
     """Dedicated background thread managing a single persistent, CDP-enabled Microsoft Edge browser."""
 
-    def __init__(self, cdp_url: str) -> None:
-        self.cdp_url = cdp_url
+    def __init__(self, explicit_cdp_url: str | None = None) -> None:
+        self._explicit_cdp = explicit_cdp_url
         self._q: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._running = False
+
+    def _current_cdp_url(self) -> str:
+        return (self._explicit_cdp or get_cdp_url(force_refresh=True)).rstrip("/")
 
     def _start_worker(self) -> None:
         with self._lock:
@@ -149,7 +212,58 @@ class _PlaywrightEdgeWorker:
             self._ready.clear()
             self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="edge-cdp-worker")
             self._thread.start()
-            self._ready.wait(timeout=10.0)
+            self._ready.wait(timeout=12.0)
+
+    def _connect_or_launch(self, playwright: Any) -> tuple[Any, Any, bool]:
+        """
+        Attach to live Edge CDP first (launching Edge debug profile if needed).
+        Returns (browser_or_none, context, owns_context).
+        """
+        cdp_http = self._current_cdp_url()
+        if not _is_cdp_reachable(cdp_http):
+            ensure_edge_cdp(cdp_http, wait_seconds=5.5)
+
+        connect_target = _resolve_cdp_connect_target(cdp_http)
+        if connect_target:
+            browser = playwright.chromium.connect_over_cdp(connect_target, timeout=6000)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            return browser, context, False
+
+        # Isolated fallback profile prevents ProcessSingleton crash if DarkShadowEdgeProfile is locked without CDP
+        fallback_profile = os.getenv(
+            "DARKSHADOW_EDGE_FALLBACK_PROFILE",
+            os.path.expandvars(r"%LOCALAPPDATA%\DarkShadowEdgeProfile_PW"),
+        )
+        _, port = _parse_cdp_host_port(cdp_http)
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=fallback_profile,
+            channel="msedge",
+            headless=False,
+            no_viewport=True,
+            args=[
+                f"--remote-debugging-port={port}",
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-allow-origins=*",
+                "--no-first-run",
+            ],
+        )
+        return None, context, True
+
+    @staticmethod
+    def _is_context_alive(browser: Any, context: Any) -> bool:
+        if context is None:
+            return False
+        if browser is not None:
+            try:
+                if hasattr(browser, "is_connected") and not browser.is_connected():
+                    return False
+            except Exception:
+                return False
+        try:
+            _ = context.pages
+            return True
+        except Exception:
+            return False
 
     def _worker_loop(self) -> None:
         if not HAS_PLAYWRIGHT:
@@ -157,24 +271,12 @@ class _PlaywrightEdgeWorker:
             return
 
         playwright = None
+        browser = None
         context = None
+        owns_context = False
         try:
             playwright = sync_playwright().start()
-            if _is_cdp_reachable(self.cdp_url):
-                browser = playwright.chromium.connect_over_cdp(self.cdp_url, timeout=4000)
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
-            else:
-                profile = os.getenv(
-                    "DARKSHADOW_EDGE_PROFILE",
-                    os.path.expandvars(r"%LOCALAPPDATA%\DarkShadowEdgeProfile"),
-                )
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile,
-                    channel="msedge",
-                    headless=False,
-                    no_viewport=True,
-                    args=["--remote-debugging-port=9222", "--remote-allow-origins=*"],
-                )
+            browser, context, owns_context = self._connect_or_launch(playwright)
         except Exception as exc:
             print(f"[EdgePlaywrightWorker] Startup notice: {exc}")
         finally:
@@ -191,18 +293,8 @@ class _PlaywrightEdgeWorker:
                 break
 
             try:
-                if context is None or (hasattr(context, "is_closed") and context.is_closed()):
-                    profile = os.getenv(
-                        "DARKSHADOW_EDGE_PROFILE",
-                        os.path.expandvars(r"%LOCALAPPDATA%\DarkShadowEdgeProfile"),
-                    )
-                    context = playwright.chromium.launch_persistent_context(
-                        user_data_dir=profile,
-                        channel="msedge",
-                        headless=False,
-                        no_viewport=True,
-                        args=["--remote-debugging-port=9222", "--remote-allow-origins=*"],
-                    )
+                if not self._is_context_alive(browser, context):
+                    browser, context, owns_context = self._connect_or_launch(playwright)
 
                 pages = [p for p in context.pages if not p.is_closed()]
                 page = None
@@ -210,26 +302,36 @@ class _PlaywrightEdgeWorker:
                     clean_dom = prefer_domain.lower().replace("www.", "")
                     page = next((pg for pg in pages if clean_dom in (pg.url or "").lower()), None)
                 if page is None:
-                    # STRICT TAB REUSE: Reuse the active page (pages[0]) to never spawn unwanted tabs!
-                    page = pages[0] if pages else context.new_page()
+                    # Prefer most recently active non-blank page, fallback to pages[0] or new_page()
+                    non_blank = [pg for pg in pages if (pg.url or "") not in ("", "about:blank")]
+                    page = non_blank[-1] if non_blank else (pages[0] if pages else context.new_page())
 
-                page.bring_to_front()
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
                 res = fn(page, context)
                 fut.set_result(res)
             except Exception as e:
+                # Reset stale handle on disconnect errors so next call cleanly reconnects
+                err_low = str(e).lower()
+                if any(tok in err_low for tok in ("closed", "disconnected", "target", "cdp", "browser")):
+                    browser = None
+                    context = None
                 fut.set_exception(e)
             finally:
                 self._q.task_done()
 
         try:
-            if context:
+            # Never close Captain's live Edge browser when attached via CDP!
+            if owns_context and context is not None:
                 context.close()
-            if playwright:
+            if playwright is not None:
                 playwright.stop()
         except Exception:
             pass
 
-    def run(self, fn: Callable[[Any, Any], Any], prefer_domain: str = "", timeout: float = 12.0) -> tuple[Any, str | None]:
+    def run(self, fn: Callable[[Any, Any], Any], prefer_domain: str = "", timeout: float = 15.0) -> tuple[Any, str | None]:
         if not HAS_PLAYWRIGHT:
             return None, "Playwright installed nahi hai (pip install playwright)."
         self._start_worker()
@@ -249,18 +351,32 @@ class EdgeBrowserAgent:
         self.last_youtube_url: str = ""
         self.last_video_title: str = ""
         self._worker: _PlaywrightEdgeWorker | None = None
+        self._worker_lock = threading.Lock()
 
     @property
     def cdp_url(self) -> str:
         return (self._explicit_cdp or get_cdp_url()).rstrip("/")
 
     def _get_worker(self) -> _PlaywrightEdgeWorker:
-        if self._worker is None:
-            self._worker = _PlaywrightEdgeWorker(self.cdp_url)
-        return self._worker
+        with self._worker_lock:
+            if self._worker is None:
+                self._worker = _PlaywrightEdgeWorker(self._explicit_cdp)
+            return self._worker
 
-    def _run_on_active_page(self, fn, prefer_domain: str = ""):
-        return self._get_worker().run(fn, prefer_domain=prefer_domain)
+    def _run_on_active_page(self, fn: Callable[[Any, Any], Any], prefer_domain: str = "", timeout: float = 15.0):
+        return self._get_worker().run(fn, prefer_domain=prefer_domain, timeout=timeout)
+
+    def cdp_diagnostics(self) -> dict[str, Any]:
+        """Return live CDP connection status and diagnostic details."""
+        info = _fetch_cdp_version(self.cdp_url)
+        return {
+            "ok": info is not None,
+            "cdp_url": self.cdp_url,
+            "resolved_http_url": info.get("_resolved_http_url") if info else None,
+            "browser": info.get("Browser") if info else None,
+            "websocket_url": info.get("webSocketDebuggerUrl") if info else None,
+            "playwright_installed": HAS_PLAYWRIGHT,
+        }
 
     def list_interactive_elements(self) -> dict[str, Any]:
         """Snapshot numbered clickable/typeable elements on the active Edge tab."""
@@ -299,11 +415,10 @@ class EdgeBrowserAgent:
         if not ok:
             return {"ok": False, "error_code": "INVALID_URL", "message": "Invalid URL."}
 
-        import urllib.parse
         parsed_netloc = urllib.parse.urlparse(target).netloc
 
         def _op(page, _ctx):
-            page.goto(target, timeout=8000, wait_until="domcontentloaded")
+            page.goto(target, timeout=10000, wait_until="domcontentloaded")
             return {"title": page.title(), "url": page.url}
 
         data, err = self._run_on_active_page(_op, prefer_domain=parsed_netloc)
@@ -392,7 +507,7 @@ class EdgeBrowserAgent:
         }
 
     def scroll_page(self, direction: str = "down", pixels: int = 550) -> dict[str, Any]:
-        """Fixed: Wrapped JS return inside an arrow function so Playwright evaluates cleanly!"""
+        """Scroll active Edge tab vertically and return updated scrollY."""
         delta = abs(int(pixels)) if direction.lower() != "up" else -abs(int(pixels))
         data, err = self._run_on_active_page(
             lambda page, _ctx: page.evaluate(f"() => {{ window.scrollBy(0, {delta}); return window.scrollY; }}")
@@ -402,7 +517,7 @@ class EdgeBrowserAgent:
         return {"ok": True, "verified_state": "scrolled", "scroll_y": data, "message": f"Page {direction} scroll kar diya."}
 
     def play_media_in_edge(self, query: str, platform: str = "youtube", start_at_seconds: float = 0.0) -> dict[str, Any]:
-        """Play music/video in Microsoft Edge using CDP or safe shell=False open_in_edge."""
+        """Play music/video in Microsoft Edge via dedicated CDP worker thread (zero sync-in-asyncio crash!)."""
         q = (query or "").strip() or "Arijit Singh songs"
         plat = platform.strip().lower()
 
@@ -443,6 +558,7 @@ class EdgeBrowserAgent:
         if not target_url:
             try:
                 import yt_dlp  # type: ignore
+
                 ydl_opts = {"quiet": True, "extract_flat": True, "noplaylist": True, "socket_timeout": 3.0}
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     res = ydl.extract_info(f"ytsearch1:{q}", download=False)
@@ -462,28 +578,24 @@ class EdgeBrowserAgent:
         self.last_youtube_url = target_url.split("&t=")[0]
         self.last_video_title = video_title
 
-        if _is_cdp_reachable(self.cdp_url) and HAS_PLAYWRIGHT:
-            try:
-                with sync_playwright() as p:
-                    browser = p.chromium.connect_over_cdp(self.cdp_url, timeout=2500)
-                    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-                    yt_page = next((pg for pg in ctx.pages if "youtube.com" in pg.url), None)
-                    if yt_page:
-                        yt_page.goto(target_url, timeout=8000, wait_until="domcontentloaded")
-                        yt_page.bring_to_front()
-                    else:
-                        p_new = ctx.new_page()
-                        p_new.goto(target_url, timeout=8000, wait_until="domcontentloaded")
-                        p_new.bring_to_front()
-                    return {
-                        "ok": True,
-                        "verified_state": "youtube_playing",
-                        "url": target_url,
-                        "video_title": video_title,
-                        "message": f"Microsoft Edge CDP ke zariye '{video_title}' play kar diya hai, Captain.",
-                    }
-            except Exception as cdp_err:
-                print(f"[CDP YouTube Playback Fallback] {cdp_err}")
+        if HAS_PLAYWRIGHT and _is_cdp_reachable(self.cdp_url):
+            def _play_op(page, ctx):
+                yt_page = next((pg for pg in ctx.pages if not pg.is_closed() and "youtube.com" in (pg.url or "")), None)
+                target_pg = yt_page or page
+                target_pg.goto(target_url, timeout=10000, wait_until="domcontentloaded")
+                target_pg.bring_to_front()
+                return {"url": target_pg.url}
+
+            data, err = self._run_on_active_page(_play_op, prefer_domain="youtube.com")
+            if not err and data:
+                return {
+                    "ok": True,
+                    "verified_state": "youtube_playing",
+                    "url": target_url,
+                    "video_title": video_title,
+                    "message": f"Microsoft Edge CDP ke zariye '{video_title}' play kar diya hai, Captain.",
+                }
+            print(f"[CDP YouTube Playback Fallback] {err}")
 
         res = open_in_edge(target_url)
         return {
@@ -495,47 +607,43 @@ class EdgeBrowserAgent:
         }
 
     def seek_video(self, seconds: float) -> dict[str, Any]:
-        """Seek active YouTube / HTML5 video honestly (never claims ok=True if nothing worked)."""
+        """Seek active YouTube / HTML5 video honestly through the dedicated CDP worker thread."""
         sec = max(0.0, float(seconds))
         mins = int(sec // 60)
         rem_sec = int(sec % 60)
         time_fmt = f"{mins} min {rem_sec} sec" if mins > 0 else f"{int(sec)} seconds"
 
-        # Tier 1: Direct Playwright CDP HTML5 <video> seek
-        for test_port_url in dict.fromkeys([self.cdp_url, "http://127.0.0.1:9333", "http://127.0.0.1:9222"]):
-            if _is_cdp_reachable(test_port_url) and HAS_PLAYWRIGHT:
-                try:
-                    with sync_playwright() as p:
-                        browser = p.chromium.connect_over_cdp(test_port_url, timeout=2500)
-                        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-                        target_page = next(
-                            (pg for pg in ctx.pages if "youtube.com" in pg.url or "watch" in pg.url),
-                            ctx.pages[-1] if ctx.pages else None,
-                        )
-                        if target_page:
-                            res = target_page.evaluate(
-                                """(targetSec) => {
-                                    const video = document.querySelector('video');
-                                    if (!video) return { found: false };
-                                    video.currentTime = targetSec;
-                                    video.play().catch(() => {});
-                                    return {
-                                        found: true,
-                                        currentTime: video.currentTime,
-                                        duration: video.duration
-                                    };
-                                }""",
-                                sec,
-                            )
-                            if res and res.get("found"):
-                                return {
-                                    "ok": True,
-                                    "verified_state": "video_seeked_cdp",
-                                    "seek_seconds": sec,
-                                    "message": f"Gaane ko {time_fmt} par seek kar diya hai, Captain.",
-                                }
-                except Exception as exc:
-                    print(f"[CDP Seek Fallback] {exc}")
+        # Tier 1: Direct Playwright CDP HTML5 <video> seek via dedicated worker thread
+        if HAS_PLAYWRIGHT and _is_cdp_reachable(self.cdp_url):
+            def _seek_op(page, ctx):
+                pages = [pg for pg in ctx.pages if not pg.is_closed()]
+                target_page = next(
+                    (pg for pg in pages if "youtube.com" in (pg.url or "") or "watch" in (pg.url or "")),
+                    page,
+                )
+                return target_page.evaluate(
+                    """(targetSec) => {
+                        const video = document.querySelector('video');
+                        if (!video) return { found: false };
+                        video.currentTime = targetSec;
+                        video.play().catch(() => {});
+                        return {
+                            found: true,
+                            currentTime: video.currentTime,
+                            duration: video.duration
+                        };
+                    }""",
+                    sec,
+                )
+
+            res, err = self._run_on_active_page(_seek_op, prefer_domain="youtube.com")
+            if not err and isinstance(res, dict) and res.get("found"):
+                return {
+                    "ok": True,
+                    "verified_state": "video_seeked_cdp",
+                    "seek_seconds": sec,
+                    "message": f"Gaane ko {time_fmt} par seek kar diya hai, Captain.",
+                }
 
         # Tier 2: Re-open last played YouTube video at exact timestamp via safe open_in_edge
         if self.last_youtube_url and "watch?v=" in self.last_youtube_url:

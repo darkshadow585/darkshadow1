@@ -19,9 +19,16 @@ import re
 import threading
 from typing import Any
 
-from browser_agent import EdgeBrowserAgent, ensure_edge_cdp, _is_cdp_reachable, HAS_PLAYWRIGHT
-from config import get_api_key, get_cdp_url, get_text_model
+from browser_agent import (
+    EdgeBrowserAgent,
+    HAS_PLAYWRIGHT,
+    _is_cdp_reachable,
+    _resolve_cdp_connect_target,
+    ensure_edge_cdp,
+)
+from config import get_api_key, get_cdp_url, get_fast_model, get_text_model
 from error_tracker import log_error
+from instant_router import RATE_SHIELD
 from windows_tools import check_hard_shields
 
 EDGE_AGENT = EdgeBrowserAgent()
@@ -53,6 +60,7 @@ class AutonomousWebAgent:
         return {
             "ok": True,
             "cdp_url": self.cdp_url,
+            "cdp_reachable": _is_cdp_reachable(self.cdp_url),
             "browser_use_installed": has_browser_use,
             "playwright_installed": has_playwright,
             "model": os.getenv("DARKSHADOW_BROWSER_MODEL", get_text_model()),
@@ -64,53 +72,46 @@ class AutonomousWebAgent:
         }
 
     def get_accessibility_tree(self, max_nodes: int = 80) -> dict[str, Any]:
-        """Reads the current Microsoft Edge tab via Playwright's compact Accessibility Tree."""
-        try:
-            from playwright.sync_api import sync_playwright  # type: ignore
-        except Exception:
+        """Reads the current Microsoft Edge tab via Playwright's Accessibility Tree through the dedicated CDP worker."""
+        if not HAS_PLAYWRIGHT:
             return EDGE_AGENT.list_interactive_elements()
 
         if not ensure_edge_cdp(self.cdp_url):
             return {"ok": False, "error_code": "CDP_UNAVAILABLE", "message": "Edge CDP port 9222 unreachable."}
 
-        lines: list[str] = []
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp(self.cdp_url, timeout=4000)
-                if not browser.contexts or not browser.contexts[0].pages:
-                    return {"ok": False, "message": "No open Microsoft Edge tabs found on CDP 9222."}
-                page = browser.contexts[0].pages[-1]
-                title = page.title()
-                url = page.url
-
-                aria_text = ""
+        def _extract_a11y(page, _ctx):
+            title = page.title()
+            url = page.url
+            aria_text = ""
+            try:
+                aria_text = page.locator("body").aria_snapshot(timeout=3000)
+            except Exception:
                 try:
-                    aria_text = page.locator("body").aria_snapshot(timeout=3000)
+                    snap = page.accessibility.snapshot(interesting_only=True)  # type: ignore[attr-defined]
+                    if snap:
+                        lines: list[str] = []
+                        self._flatten_a11y(snap, lines, max_nodes)
+                        aria_text = "\n".join(lines)
                 except Exception:
-                    try:
-                        snap = page.accessibility.snapshot(interesting_only=True)  # type: ignore[attr-defined]
-                        if snap:
-                            self._flatten_a11y(snap, lines, max_nodes)
-                            aria_text = "\n".join(lines)
-                    except Exception:
-                        pass
+                    pass
+            return {"title": title, "url": url, "aria_text": aria_text}
 
-                if not aria_text:
-                    return EDGE_AGENT.list_interactive_elements()
-
-                trimmed_lines = aria_text.splitlines()[:max_nodes]
-                return {
-                    "ok": True,
-                    "mode": "playwright_accessibility_tree",
-                    "title": title,
-                    "url": url,
-                    "node_count": len(trimmed_lines),
-                    "tree": "\n".join(trimmed_lines),
-                    "message": f"Read Accessibility Tree for '{title}' ({len(trimmed_lines)} nodes).",
-                }
-        except Exception as exc:
-            log_error("autonomous_web_agent", f"get_accessibility_tree failed: {exc}", exception=exc)
+        data, err = EDGE_AGENT._run_on_active_page(_extract_a11y)
+        if err or not isinstance(data, dict) or not data.get("aria_text"):
+            if err:
+                log_error("autonomous_web_agent", f"get_accessibility_tree failed: {err}")
             return EDGE_AGENT.list_interactive_elements()
+
+        trimmed_lines = str(data["aria_text"]).splitlines()[:max_nodes]
+        return {
+            "ok": True,
+            "mode": "playwright_accessibility_tree",
+            "title": data.get("title", ""),
+            "url": data.get("url", ""),
+            "node_count": len(trimmed_lines),
+            "tree": "\n".join(trimmed_lines),
+            "message": f"Read Accessibility Tree for '{data.get('title', '')}' ({len(trimmed_lines)} nodes).",
+        }
 
     def _flatten_a11y(self, node: dict[str, Any], out: list[str], limit: int, depth: int = 0) -> None:
         if len(out) >= limit:
@@ -145,6 +146,8 @@ class AutonomousWebAgent:
         if not ensure_edge_cdp(self.cdp_url):
             return {"ok": False, "error_code": "CDP_UNAVAILABLE", "message": "Edge CDP port 9222 unreachable."}
 
+        live_cdp_url = (self._explicit_cdp or get_cdp_url(force_refresh=True)).rstrip("/")
+
         try:
             from browser_use import Agent, Browser  # type: ignore
         except Exception:
@@ -170,10 +173,10 @@ class AutonomousWebAgent:
         browser: Any = None
         try:
             try:
-                browser = Browser(cdp_url=self.cdp_url)
+                browser = Browser(cdp_url=live_cdp_url)
             except TypeError:
                 from browser_use import BrowserConfig  # type: ignore
-                browser = Browser(config=BrowserConfig(cdp_url=self.cdp_url))
+                browser = Browser(config=BrowserConfig(cdp_url=live_cdp_url))
 
             full_task = (
                 f"{goal}\n"
@@ -237,13 +240,13 @@ class AutonomousWebAgent:
         tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
 
         # Step 1: Detect sites and open search tabs in Microsoft Edge only if not cancelled
-        cdp_active = _is_cdp_reachable(self.cdp_url)
+        connect_target = _resolve_cdp_connect_target(self.cdp_url)
         opened_sites = []
-        if cdp_active and HAS_PLAYWRIGHT and not (cancel_event and cancel_event.is_set()):
+        if connect_target and HAS_PLAYWRIGHT and not (cancel_event and cancel_event.is_set()):
             try:
                 from playwright.async_api import async_playwright
                 async with async_playwright() as p:
-                    b = await p.chromium.connect_over_cdp(self.cdp_url, timeout=3000)
+                    b = await p.chromium.connect_over_cdp(connect_target, timeout=5000)
                     ctx = b.contexts[0] if b.contexts else await b.new_context()
 
                     for site, s_url in [
@@ -310,8 +313,8 @@ class AutonomousWebAgent:
                     "2. Followed by a clean Markdown comparison table comparing the top 5 results across the platforms (Brand, Price in INR, Fabric/Design, Rating, Platform).\n"
                     "3. Conclude with a clear recommendation (e.g. Best budget option vs Best quality/brand option)."
                 )
-                models_to_try = [get_text_model(), "gemini-3.8-flash", "gemini-3.1-flash-lite"]
-                for m_name in dict.fromkeys(models_to_try):
+                models_to_try = RATE_SHIELD.choose_models([get_text_model(), get_fast_model()])
+                for m_name in models_to_try:
                     try:
                         resp = client.models.generate_content(model=m_name, contents=prompt)
                         if resp.text:
@@ -319,7 +322,9 @@ class AutonomousWebAgent:
                             lines = [ln.strip() for ln in comparison_text.splitlines() if ln.strip()]
                             spoken_summary = lines[0] if lines else "Research complete ho gaya hai, Captain."
                             break
-                    except Exception:
+                    except Exception as model_exc:
+                        if RATE_SHIELD.is_quota_error(model_exc):
+                            RATE_SHIELD.mark_rate_limited(m_name, cooldown_seconds=45.0)
                         continue
             except Exception as e:
                 print(f"[Gemini Synthesis Error] {e}")

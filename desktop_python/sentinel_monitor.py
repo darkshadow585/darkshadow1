@@ -23,10 +23,12 @@ class DesktopSentinel:
         memory: SemanticMemoryEngine,
         on_proactive_alert: Callable[[str], None],
         poll_seconds: float = 15.0,
+        monitor_battery: bool = True,
     ) -> None:
         self._memory = memory
         self._on_alert = on_proactive_alert
         self._poll = poll_seconds
+        self._monitor_battery = monitor_battery
         self._stop = threading.Event()
         self._battery_warned = False
 
@@ -45,7 +47,7 @@ class DesktopSentinel:
             except Exception:
                 pass
 
-            if HAS_PSUTIL:
+            if self._monitor_battery and HAS_PSUTIL:
                 try:
                     batt = psutil.sensors_battery()
                     if batt is not None:

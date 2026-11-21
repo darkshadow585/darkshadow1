@@ -62,11 +62,32 @@ class _PersistentMCPWorker:
 
         raw_cmd = str(cfg["command"])
         resolved_cmd = shutil.which(raw_cmd) or raw_cmd
+        args_list = [str(a) for a in cfg.get("args", [])]
+
+        # Ensure Edge CDP is running and inject exact live IPv4/IPv6 endpoint for Playwright MCP!
+        if server_name == "playwright" and "--cdp-endpoint" in args_list:
+            try:
+                from browser_agent import ensure_edge_cdp
+                from config import get_cdp_url
+
+                await asyncio.to_thread(ensure_edge_cdp)
+                live_cdp = get_cdp_url(force_refresh=True)
+                idx = args_list.index("--cdp-endpoint")
+                if idx + 1 < len(args_list):
+                    args_list[idx + 1] = live_cdp
+            except Exception:
+                pass
+
+        merged_env = dict(os.environ)
+        for k, v in (cfg.get("env") or {}).items():
+            val_str = os.path.expandvars(str(v))
+            if val_str:
+                merged_env[str(k)] = val_str
 
         params = StdioServerParameters(
             command=resolved_cmd,
-            args=[str(a) for a in cfg.get("args", [])],
-            env={**os.environ, **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}},
+            args=args_list,
+            env=merged_env,
         )
 
         stack = AsyncExitStack()

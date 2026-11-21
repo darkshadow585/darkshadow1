@@ -114,7 +114,8 @@ def log_error(
             except Exception as s_err:
                 print(f"[Sentry Dispatch Error] {s_err}")
 
-        threading.Thread(target=_dispatch_sentry, daemon=True, name="sentry-dispatch").start()
+        if HAS_SENTRY:
+            threading.Thread(target=_dispatch_sentry, daemon=True, name="sentry-dispatch").start()
 
         # 2. SECONDARY: Persist to local JSONL log
         with _ERR_LOCK:

@@ -8,7 +8,7 @@
         "-y",
         "@playwright/mcp@latest",
         "--cdp-endpoint",
-        "http://localhost:9222"
+        "http://127.0.0.1:9222"
       ]
     },
     "windows": {
@@ -21,16 +21,14 @@
     },
     "composio": {
       "enabled": false,
-      "description": "Stage 3: Composio MCP server (handled directly via ComposioAppBridge in composio_bridge.py)",
+      "description": "Stage 3: Composio MCP server (handled directly via ComposioAppBridge in composio_bridge.py; reads COMPOSIO_API_KEY from .env)",
       "command": "npx",
       "args": [
         "-y",
         "mcp-remote",
-        "https://mcp.composio.dev/mcp"
+        "https://connect.composio.dev/mcp"
       ],
-      "env": {
-        "COMPOSIO_API_KEY": "ck_9RHrHe2RGrQx0YYCneki"
-      }
+      "env": {}
     },
     "filesystem": {
       "enabled": false,

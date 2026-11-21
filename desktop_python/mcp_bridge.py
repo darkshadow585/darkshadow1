@@ -472,7 +472,7 @@ class MCPToolRegistry:
                         "type": "STRING",
                         "enum": [
                             "open_url", "search_google", "read_page", "list_elements",
-                            "a11y_tree", "click", "type_and_submit", "scroll",
+                            "a11y_tree", "click", "type_and_submit", "scroll", "cdp_status",
                         ],
                         "description": "Browser automation action",
                     },
@@ -522,6 +522,8 @@ class MCPToolRegistry:
                 return self.browser.type_and_submit(text=query_or_url.strip(), element_id=element_id, press_enter=True)
             if action == "scroll":
                 return self.browser.scroll_page(direction=direction)
+            if action == "cdp_status":
+                return self.browser.cdp_diagnostics()
             return {"ok": False, "error_code": "INVALID_ACTION", "message": f"Unsupported browser action '{action}'."}
 
         # 5. WhatsApp Messaging with 2-Step Confirmation Gate
@@ -937,9 +939,11 @@ class MCPToolRegistry:
             run_in_background: bool = True,
         ) -> dict[str, Any]:
             if action == "status":
+                planner = _get_planner_engine()
+                planner_status = planner.status() if hasattr(planner, "status") else _get_reasoning_engine().status()
                 return {
                     "ok": True,
-                    "reasoning": _get_reasoning_engine().status(),
+                    "reasoning": planner_status,
                     "web_agent": _get_web_agent().check_capabilities(),
                 }
             if action == "cancel_all":
@@ -950,8 +954,14 @@ class MCPToolRegistry:
                         return {"ok": True, "job": self._jobs[job_id]}
                     return {"ok": True, "jobs": list(self._jobs.values())[-5:]}
             if action == "resume_approve":
+                planner = _get_planner_engine()
+                if hasattr(planner, "resume_approval"):
+                    return planner.resume_approval(thread_id, approved=True)
                 return _get_reasoning_engine().resume_approval(thread_id, approved=True)
             if action == "resume_cancel":
+                planner = _get_planner_engine()
+                if hasattr(planner, "resume_approval"):
+                    return planner.resume_approval(thread_id, approved=False)
                 return _get_reasoning_engine().resume_approval(thread_id, approved=False)
             if action == "run_planner":
                 if not goal.strip():
@@ -1021,24 +1031,53 @@ class MCPToolRegistry:
         # 12.5 External SaaS App Integrations via Composio (Gmail, GitHub, Google Calendar, Slack, Notion)
         @m.tool(
             name="composio_action",
-            description="Execute external SaaS actions via Composio (Gmail, GitHub, Google Calendar, Slack, Notion). Requires confirmed=True for mutating actions (send, create, delete).",
+            description=(
+                "Execute external SaaS actions via Composio (Gmail, GitHub, Google Calendar, Slack, Notion). "
+                "Supports diagnostic slugs COMPOSIO_HEALTH_CHECK, COMPOSIO_LIST_CONNECTIONS, and COMPOSIO_CONNECT_APP. "
+                "Requires confirmed=True for mutating actions (send, create, delete)."
+            ),
             parameters={
                 "type": "OBJECT",
                 "properties": {
-                    "action_slug": {"type": "STRING", "description": "e.g. GMAIL_FETCH_EMAILS, GMAIL_SEND_EMAIL, GITHUB_CREATE_AN_ISSUE"},
-                    "arguments_json": {"type": "STRING", "description": "JSON string of action parameters"},
+                    "action_slug": {"type": "STRING", "description": "e.g. GMAIL_FETCH_EMAILS, GMAIL_SEND_EMAIL, GITHUB_CREATE_AN_ISSUE, COMPOSIO_HEALTH_CHECK"},
+                    "arguments_json": {"type": "STRING", "description": "JSON object string of action parameters"},
                     "confirmed": {"type": "BOOLEAN", "description": "Set true only after Captain confirms write action"},
                 },
                 "required": ["action_slug"],
             },
         )
         def tool_composio_action(action_slug: str, arguments_json: str = "{}", confirmed: bool = False) -> dict[str, Any]:
-            import json
-            try:
-                args = json.loads(arguments_json) if arguments_json.strip() else {}
-            except Exception:
-                args = {}
+            raw_args = (arguments_json or "").strip()
+            if not raw_args:
+                args: dict[str, Any] = {}
+            else:
+                try:
+                    parsed = json.loads(raw_args)
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "error_code": "INVALID_JSON",
+                        "message": f"Invalid arguments_json for composio_action: {exc}",
+                    }
+                if not isinstance(parsed, dict):
+                    return {
+                        "ok": False,
+                        "error_code": "INVALID_JSON",
+                        "message": "arguments_json must be a JSON object (e.g. '{\"max_results\": 5}').",
+                    }
+                args = parsed
+
             from composio_bridge import COMPOSIO_BRIDGE
+            norm_slug = (action_slug or "").strip().upper()
+            if norm_slug in ("COMPOSIO_HEALTH_CHECK", "HEALTH_CHECK"):
+                return COMPOSIO_BRIDGE.health_check()
+            if norm_slug in ("COMPOSIO_LIST_CONNECTIONS", "LIST_CONNECTED_APPS"):
+                return COMPOSIO_BRIDGE.list_connected_apps()
+            if norm_slug in ("COMPOSIO_CONNECT_APP", "CONNECT_APP"):
+                app_name = str(args.get("app_name") or args.get("toolkit") or args.get("app") or "").strip()
+                if not app_name:
+                    return {"ok": False, "error_code": "INVALID_ARGS", "message": "app_name required (e.g. GMAIL, GITHUB)."}
+                return COMPOSIO_BRIDGE.check_or_initiate_connection(app_name)
             return COMPOSIO_BRIDGE.execute_action(action_slug=action_slug, arguments=args, confirmed=confirmed)
 
         # 13. Personal Knowledge Vault (Local Private SQLite FTS5 RAG over PDFs, Notes & Code — Zero Heavy ML!)
@@ -1118,7 +1157,14 @@ class MCPToolRegistry:
                     return {"ok": False, "error_code": "INVALID_JSON", "message": f"Invalid steps_json: {exc}"}
                 return _get_playbook_engine().save_playbook(name=name, steps=steps, description=description)
             if action == "playbook_save_last_plan":
-                goal, trace = _get_reasoning_engine().get_last_successful_trace()
+                planner = _get_planner_engine()
+                goal, trace = (
+                    planner.get_last_successful_trace()
+                    if hasattr(planner, "get_last_successful_trace")
+                    else ("", [])
+                )
+                if not trace:
+                    goal, trace = _get_reasoning_engine().get_last_successful_trace()
                 return _get_playbook_engine().save_from_react_trace(name=name or "learned_workflow", trace=trace, goal=goal)
             if action == "focus_start":
                 return FOCUS_SENTINEL.start_focus(minutes=minutes, label=name or "Deep Work")
@@ -1264,18 +1310,26 @@ class MCPToolRegistry:
             if p_type == "BOOLEAN":
                 clean_args[key] = _coerce_bool(val)
                 val = clean_args[key]
-            elif p_type == "INTEGER" and not isinstance(val, bool):
+            elif p_type == "INTEGER" and val is not None and not isinstance(val, bool):
                 try:
                     clean_args[key] = int(float(str(val).strip()))
                     val = clean_args[key]
                 except Exception:
-                    pass
-            elif p_type == "NUMBER" and not isinstance(val, bool):
+                    return {
+                        "ok": False,
+                        "error_code": "INVALID_TYPE",
+                        "message": f"Parameter '{key}' must be an integer, got '{val}'.",
+                    }
+            elif p_type == "NUMBER" and val is not None and not isinstance(val, bool):
                 try:
                     clean_args[key] = float(str(val).strip())
                     val = clean_args[key]
                 except Exception:
-                    pass
+                    return {
+                        "ok": False,
+                        "error_code": "INVALID_TYPE",
+                        "message": f"Parameter '{key}' must be a number, got '{val}'.",
+                    }
 
             allowed_enum = p_meta.get("enum")
             if allowed_enum:

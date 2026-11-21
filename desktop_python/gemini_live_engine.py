@@ -92,6 +92,7 @@ PERSONA_PROMPTS: dict[str, str] = {
 TOOL_TIMEOUTS: dict[str, float] = {
     "mcp_hub_action": 55.0,
     "autonomous_agent": 45.0,
+    "composio_action": 25.0,
     "browser_interact": 25.0,
     "screen_vision": 20.0,
 }
@@ -406,7 +407,8 @@ class GeminiLiveVoiceEngine:
             "   - Apps/Windows: `app_and_window(action='open'|'close'|'minimize'|'maximize'|'show_desktop'|'lock_pc', app_name=...)`\n"
             "   - Music/Seek/Volume/Brightness: `media_and_device(action='play_music'|'seek'|'pause'|'play'|'next'|'now_playing'|'set_volume'|'mute'|'set_brightness', ...)`\n"
             "   - Weather/Web Search: `web_search_and_weather(action='get_weather'|'search_web', query=...)`\n"
-            "   - Edge Browser: `browser_interact(...)` (summarize page content instead of just saying opened)\n"
+            "   - Edge Browser: `browser_interact(...)` (supports `cdp_status` for Edge CDP diagnostics; summarize page content instead of just saying opened)\n"
+            "   - External SaaS (Gmail/GitHub/Calendar/Slack/Notion): `composio_action(action_slug=..., arguments_json=..., confirmed=false|true)` (supports `COMPOSIO_HEALTH_CHECK`, `COMPOSIO_LIST_CONNECTIONS`, `COMPOSIO_CONNECT_APP`; always ask Captain before setting confirmed=true on send/create/delete)\n"
             "   - Screen Vision: `screen_vision(action='snapshot'|'start_watch'|'stop_watch', question=...)`\n"
             "   - Memory & Reminders: `memory_control(action='save'|'recall'|'remind'|'append_block', ...)`\n"
             "   - Complex Multi-Step Tasks: `autonomous_agent(action='run_planner'|'run_web_agent'|'cancel_all', goal=...)`\n"
@@ -548,7 +550,11 @@ class GeminiLiveVoiceEngine:
                         preds = self._oww_model.predict(arr)
                         if any(score > 0.55 for score in preds.values()):
                             self._oww_model.reset()
-                            self.trigger_wake_greeting()
+                            threading.Thread(
+                                target=self.trigger_wake_greeting,
+                                daemon=True,
+                                name="oww-wake-greeting",
+                            ).start()
                             return
                     except Exception:
                         pass
