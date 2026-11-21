@@ -9,3 +9,6 @@ coverage/
 .darkshadow/
 *.db
 msedge_log.txt
+
+__pycache__/
+*.pyc
