@@ -91,8 +91,10 @@ def log_error(
         def _dispatch_sentry() -> None:
             try:
                 import sentry_sdk
-                with sentry_sdk.push_scope() as scope:
-                    scope.set_tag("category", category)
+                scope_mgr = getattr(sentry_sdk, "isolation_scope", None) or getattr(sentry_sdk, "new_scope", None) or getattr(sentry_sdk, "push_scope", None)
+                if scope_mgr:
+                    with scope_mgr() as scope:
+                        scope.set_tag("category", category)
                     scope.set_tag("error_id", err_id)
                     scope.set_tag("status", status)
                     scope.set_tag("app", "darkshadow-desktop")

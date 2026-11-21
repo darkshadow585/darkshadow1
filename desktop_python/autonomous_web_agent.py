@@ -16,15 +16,21 @@ import asyncio
 import concurrent.futures
 import os
 import re
+import subprocess
 import threading
+import time
+import urllib.parse
+import urllib.request
 from typing import Any
 
 from browser_agent import (
     EdgeBrowserAgent,
     HAS_PLAYWRIGHT,
     _is_cdp_reachable,
+    _parse_cdp_host_port,
     _resolve_cdp_connect_target,
     ensure_edge_cdp,
+    find_edge_executable,
 )
 from config import get_api_key, get_cdp_url, get_fast_model, get_text_model
 from error_tracker import log_error
@@ -32,6 +38,113 @@ from instant_router import RATE_SHIELD
 from windows_tools import check_hard_shields
 
 EDGE_AGENT = EdgeBrowserAgent()
+
+
+class CDPExecutionLock:
+    """
+    Global hybrid async/thread lock ensuring only ONE web task accesses
+    localhost:9222 at a time. If a second task arrives while one is running,
+    it waits in queue instead of crashing.
+    """
+
+    def __init__(self) -> None:
+        self._thread_lock = threading.Lock()
+        self._async_lock: asyncio.Lock | None = None
+        self._loop_id: int | None = None
+
+    def _get_async_lock(self) -> asyncio.Lock:
+        try:
+            curr_loop = asyncio.get_running_loop()
+            curr_id = id(curr_loop)
+            if self._async_lock is None or self._loop_id != curr_id:
+                self._async_lock = asyncio.Lock()
+                self._loop_id = curr_id
+            return self._async_lock
+        except RuntimeError:
+            if self._async_lock is None:
+                self._async_lock = asyncio.Lock()
+            return self._async_lock
+
+    async def __aenter__(self):
+        # 1. Async queue lock for tasks sharing the same loop
+        async_lock = self._get_async_lock()
+        await async_lock.acquire()
+        # 2. Polling acquire for thread lock to coordinate across worker threads
+        while not self._thread_lock.acquire(blocking=False):
+            await asyncio.sleep(0.2)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self._thread_lock.release()
+        except RuntimeError:
+            pass
+        async_lock = self._get_async_lock()
+        if async_lock.locked():
+            async_lock.release()
+
+
+GLOBAL_CDP_WEB_LOCK = CDPExecutionLock()
+
+
+def check_cdp_endpoint_reachable(cdp_url: str = "http://localhost:9222", timeout: float = 0.8) -> bool:
+    """Check if http://localhost:9222/json or /json/version is reachable."""
+    host, port = _parse_cdp_host_port(cdp_url)
+    endpoints = [
+        f"http://{host}:{port}/json",
+        f"http://127.0.0.1:{port}/json",
+        f"http://[{host}]:{port}/json" if ":" in host and not host.startswith("[") else None,
+        f"http://{host}:{port}/json/version",
+        f"http://127.0.0.1:{port}/json/version",
+    ]
+    for ep in filter(None, endpoints):
+        try:
+            req = urllib.request.Request(ep, headers={"Host": f"localhost:{port}"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status in (200, 204):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def ensure_edge_cdp_persistent(cdp_url: str = "http://localhost:9222", wait_seconds: float = 8.0) -> bool:
+    """
+    Ensure Edge is running with CDP port 9222 and dedicated persistent user data dir.
+    Preserves all logins (Flipkart, YouTube, Amazon, Google, etc.) across sessions.
+    """
+    if check_cdp_endpoint_reachable(cdp_url):
+        return True
+
+    try:
+        host, port = _parse_cdp_host_port(cdp_url)
+        user_data = os.getenv(
+            "DARKSHADOW_EDGE_PROFILE",
+            os.path.expandvars(r"%LOCALAPPDATA%\DarkShadowEdgeProfile"),
+        )
+        os.makedirs(user_data, exist_ok=True)
+        edge_exe = find_edge_executable()
+        args = [
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-allow-origins=*",
+            f"--user-data-dir={user_data}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if edge_exe:
+            subprocess.Popen([edge_exe, *args], shell=False)
+        else:
+            subprocess.Popen(["cmd", "/c", "start", "", "msedge", *args], shell=False)
+
+        deadline = time.monotonic() + max(2.0, float(wait_seconds))
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if check_cdp_endpoint_reachable(cdp_url):
+                return True
+    except Exception as exc:
+        log_error("autonomous_web_agent", f"Failed to auto-launch Edge with CDP: {exc}", exception=exc)
+    return False
 
 
 class AutonomousWebAgent:
@@ -131,7 +244,7 @@ class AutonomousWebAgent:
         start_url: str | None = None,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Runs a full autonomous multi-step browser goal via `browser-use` on free-tier gemini-4-hydrogen."""
+        """Runs a full autonomous multi-step browser goal via `browser-use` on Edge CDP."""
         shield = check_hard_shields(goal)
         if shield:
             return {"ok": False, "blocked": True, "error_code": "SHIELD_BLOCKED", "message": shield}
@@ -143,83 +256,88 @@ class AutonomousWebAgent:
         if not api_key:
             return {"ok": False, "message": "GEMINI_API_KEY missing in .env."}
 
-        if not ensure_edge_cdp(self.cdp_url):
-            return {"ok": False, "error_code": "CDP_UNAVAILABLE", "message": "Edge CDP port 9222 unreachable."}
+        # 1. Global Queue Lock: Ensures only ONE web task accesses localhost:9222 at a time.
+        # Concurrent tasks wait cleanly in queue instead of colliding and crashing.
+        async with GLOBAL_CDP_WEB_LOCK:
+            if cancel_event and cancel_event.is_set():
+                return {"ok": False, "error_code": "CANCELLED", "message": "Captain ne task cancel kar diya."}
 
-        live_cdp_url = (self._explicit_cdp or get_cdp_url(force_refresh=True)).rstrip("/")
-
-        try:
-            from browser_use import Agent, Browser  # type: ignore
-        except Exception:
-            # Fallback to Built-in High-Speed Autonomous Research & Shopping Engine!
-            return await self._run_autonomous_research_and_shopping(goal=goal, start_url=start_url, cancel_event=cancel_event)
-
-        llm: Any = None
-        model_name = os.getenv("DARKSHADOW_BROWSER_MODEL", get_text_model()).strip() or get_text_model()
-        try:
-            from browser_use.llm import ChatGoogle  # type: ignore
-            llm = ChatGoogle(model=model_name, api_key=api_key)
-        except Exception:
-            try:
-                from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
-                llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key)
-            except Exception as exc:
-                log_error("autonomous_web_agent", f"LLM init failed: {exc}", exception=exc)
+            # 3. Check if http://localhost:9222/json is reachable; if not, launch Edge with persistent user-data-dir
+            if not ensure_edge_cdp_persistent(self.cdp_url):
                 return {
                     "ok": False,
-                    "message": "Install `langchain-google-genai` or latest `browser-use` for Gemini support.",
+                    "error_code": "CDP_UNAVAILABLE",
+                    "message": "Edge CDP port 9222 unreachable on http://localhost:9222/json.",
                 }
 
-        browser: Any = None
-        try:
+            live_cdp_url = (self._explicit_cdp or get_cdp_url(force_refresh=True)).rstrip("/")
+
             try:
-                browser = Browser(cdp_url=live_cdp_url)
-            except TypeError:
-                from browser_use import BrowserConfig  # type: ignore
-                browser = Browser(config=BrowserConfig(cdp_url=live_cdp_url))
+                from browser_use import Agent, Browser  # type: ignore
+            except Exception:
+                # Fallback to Built-in High-Speed Autonomous Research & Shopping Engine!
+                return await self._run_autonomous_research_and_shopping(goal=goal, start_url=start_url, cancel_event=cancel_event)
 
-            full_task = (
-                f"{goal}\n"
-                "STRICT SAFETY RULE: NEVER complete payments, checkout, enter passwords/OTP/CVV, "
-                "or submit financial transfers. Stop right before any payment/checkout step."
-            )
-            if start_url:
-                full_task = f"First open {start_url}. Then: {full_task}"
-
-            agent = Agent(task=full_task, llm=llm, browser=browser)
-            history = await agent.run(max_steps=max(2, min(max_steps, 20)))
-
-            final_text = ""
-            if hasattr(history, "final_result") and callable(history.final_result):
-                final_text = str(history.final_result() or "").strip()
-            if not final_text:
-                final_text = str(history)[:800]
-
-            return {
-                "ok": True,
-                "mode": "browser_use_cdp",
-                "goal": goal,
-                "result": final_text,
-                "message": final_text or f"Autonomous browser goal completed: {goal}",
-            }
-        except Exception as exc:
-            log_error("autonomous_web_agent", f"browser-use execution error: {exc}", exception=exc)
-            return {
-                "ok": False,
-                "mode": "browser_use_error",
-                "message": f"Autonomous browser agent error: {exc}.",
-            }
-        finally:
-            if browser is not None:
+            llm: Any = None
+            model_name = os.getenv("DARKSHADOW_BROWSER_MODEL", get_text_model()).strip() or get_text_model()
+            try:
+                from browser_use.llm import ChatGoogle  # type: ignore
+                llm = ChatGoogle(model=model_name, api_key=api_key)
+            except Exception:
                 try:
-                    # Only detach/stop CDP handle cleanly when available
-                    close_fn = getattr(browser, "stop", None) or getattr(browser, "close", None)
-                    if callable(close_fn):
-                        maybe_coro = close_fn()
-                        if asyncio.iscoroutine(maybe_coro):
-                            await maybe_coro
-                except Exception:
-                    pass
+                    from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+                    llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key)
+                except Exception as exc:
+                    log_error("autonomous_web_agent", f"LLM init failed: {exc}", exception=exc)
+                    return {
+                        "ok": False,
+                        "message": "Install `langchain-google-genai` or latest `browser-use` for Gemini support.",
+                    }
+
+            browser: Any = None
+            try:
+                # 2. Connect to existing Edge CDP with keep_alive=True so process is never killed
+                try:
+                    browser = Browser(cdp_url=live_cdp_url, keep_alive=True)
+                except TypeError:
+                    browser = Browser(cdp_url=live_cdp_url)
+
+                full_task = (
+                    f"{goal}\n"
+                    "STRICT SAFETY RULE: NEVER complete payments, checkout, enter passwords/OTP/CVV, "
+                    "or submit financial transfers. Stop right before any payment/checkout step."
+                )
+                if start_url:
+                    full_task = f"First open {start_url}. Then: {full_task}"
+
+                agent = Agent(task=full_task, llm=llm, browser=browser)
+                history = await agent.run(max_steps=max(2, min(max_steps, 20)))
+
+                final_text = ""
+                if hasattr(history, "final_result") and callable(history.final_result):
+                    final_text = str(history.final_result() or "").strip()
+                if not final_text:
+                    final_text = str(history)[:800]
+
+                return {
+                    "ok": True,
+                    "mode": "browser_use_cdp",
+                    "goal": goal,
+                    "result": final_text,
+                    "message": final_text or f"Autonomous browser goal completed: {goal}",
+                }
+            except Exception as exc:
+                log_error("autonomous_web_agent", f"browser-use execution error: {exc}", exception=exc)
+                return {
+                    "ok": False,
+                    "mode": "browser_use_error",
+                    "message": f"Autonomous browser agent error: {exc}.",
+                }
+            finally:
+                # 2. Shared CDP Session: NEVER call browser.close() or browser.stop()!
+                # By omitting close/stop and using keep_alive=True, Edge stays open
+                # preserving all open tabs and logins (YouTube, Flipkart, etc.).
+                pass
 
     async def _run_autonomous_research_and_shopping(
         self,

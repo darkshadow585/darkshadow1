@@ -127,7 +127,7 @@ def _fetch_cdp_version(cdp_url: str | None = None, timeout: float = 0.6) -> dict
 
         base = _format_http_host(h, port)
         try:
-            req = urllib.request.Request(f"{base}/json/version", headers={"Host": "localhost"})
+            req = urllib.request.Request(f"{base}/json/version", headers={"Host": f"127.0.0.1:{port}"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -144,14 +144,21 @@ def _is_cdp_reachable(cdp_url: str | None = None) -> bool:
 
 
 def _resolve_cdp_connect_target(cdp_url: str | None = None) -> str | None:
-    """Return the most reliable CDP target (WebSocket URL if available, else resolved HTTP base URL)."""
+    """Return the most reliable CDP target (WebSocket URL if available with port, else resolved HTTP base URL)."""
     info = _fetch_cdp_version(cdp_url)
     if not info:
         return None
+    resolved_base = str(info.get("_resolved_http_url") or "").rstrip("/")
     ws_url = str(info.get("webSocketDebuggerUrl") or "").strip()
     if ws_url.startswith(("ws://", "wss://")):
+        parsed_ws = urllib.parse.urlparse(ws_url)
+        # Fix missing port bug: if Edge omits port, enforce 127.0.0.1:{port}
+        if not parsed_ws.port:
+            _, port = _parse_cdp_host_port(resolved_base or cdp_url or "http://127.0.0.1:9222")
+            netloc = f"127.0.0.1:{port}"
+            ws_url = urllib.parse.urlunparse((parsed_ws.scheme, netloc, parsed_ws.path, parsed_ws.params, parsed_ws.query, parsed_ws.fragment))
         return ws_url
-    return str(info.get("_resolved_http_url") or "") or None
+    return resolved_base or None
 
 
 def ensure_edge_cdp(cdp_url: str | None = None, wait_seconds: float = 6.0) -> bool:
@@ -225,9 +232,18 @@ class _PlaywrightEdgeWorker:
 
         connect_target = _resolve_cdp_connect_target(cdp_http)
         if connect_target:
-            browser = playwright.chromium.connect_over_cdp(connect_target, timeout=6000)
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            return browser, context, False
+            try:
+                browser = playwright.chromium.connect_over_cdp(connect_target, timeout=6000)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                return browser, context, False
+            except Exception:
+                try:
+                    _, port = _parse_cdp_host_port(cdp_http)
+                    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=6000)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    return browser, context, False
+                except Exception:
+                    pass
 
         # Isolated fallback profile prevents ProcessSingleton crash if DarkShadowEdgeProfile is locked without CDP
         fallback_profile = os.getenv(

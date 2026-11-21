@@ -270,10 +270,29 @@ def validate_http_url(url: str) -> tuple[bool, str]:
 
 
 def open_in_edge(url: str) -> dict[str, Any]:
-    """Launch a URL strictly in Microsoft Edge using shell=False (safe with '&' query params!)."""
+    """Launch a URL strictly in Microsoft Edge, reusing the existing Edge CDP window when open to prevent multiple windows."""
     ok, clean_url = validate_http_url(url)
     if not ok:
         return {"ok": False, "error_code": "INVALID_URL", "message": "Invalid ya unsafe URL."}
+
+    # 1. Try reusing existing Edge instance via CDP HTTP endpoint to avoid opening duplicate windows
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:9222/json/new?{urllib.parse.quote(clean_url, safe=':/?#[]@!$&()*+,;=')}",
+            headers={"Host": "127.0.0.1:9222"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            if resp.status == 200:
+                return {
+                    "ok": True,
+                    "verified_state": "opened_in_existing_edge_tab",
+                    "url": clean_url,
+                    "message": f"Pehle se khule Microsoft Edge ke tab mein {clean_url} open kar diya hai.",
+                }
+    except Exception:
+        pass
+
     try:
         edge_exe = find_edge_executable()
         if edge_exe:
